@@ -1,4 +1,15 @@
+# EnviroSense
 
+EnviroSense is a cross-platform mobile application built with Flutter, designed to connect with ESP32-based sensor devices over Bluetooth Low Energy (BLE) and display real-time environmental readings — including temperature, humidity, pressure, and light — through a clean, modern dashboard interface.
+
+**Status: Under Active Development**
+Core UI and BLE connection logic have been implemented. Live sensor data streaming from the ESP32 is the next milestone. New updates will be added soon as development progresses.
+
+---
+
+## Overview
+
+EnviroSense serves as the mobile companion application for an ESP32-powered environment monitoring system.
 The application is designed to:
 
 1. Scan for nearby BLE devices
