@@ -3,8 +3,13 @@ import 'package:go_router/go_router.dart';
 
 import '../features/dashboard/presentation/dashboard_screen.dart';
 import '../features/devices/presentation/device_scan_screen.dart';
+import '../features/devices/presentation/devices_screen.dart';
+import '../features/room/presentation/room_view_route.dart';
+import '../features/settings/presentation/settings_screen.dart';
+import '../features/trends/presentation/trends_screen.dart';
 import 'app_motion.dart';
 import 'app_theme.dart';
+import 'shell/app_shell.dart';
 
 Page<void> _premiumPage(GoRouterState state, Widget child) {
   return CustomTransitionPage<void>(
@@ -53,8 +58,27 @@ final _router = GoRouter(
   routes: [
     GoRoute(
       path: '/',
-      pageBuilder: (context, state) =>
-          _premiumPage(state, const DashboardScreen()),
+      pageBuilder: (context, state) => _premiumPage(
+        state,
+        EnviroSenseShell(
+          pages: [
+            const DashboardScreen(),
+            const RoomViewRoute(),
+            const TrendsScreen(),
+            const DevicesScreen(),
+            const SettingsScreen(),
+          ],
+          onAddDevice: () {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'Device pairing will be completed in the hardware integration phase.',
+                ),
+              ),
+            );
+          },
+        ),
+      ),
     ),
     GoRoute(
       path: '/scan',
