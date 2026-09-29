@@ -21,18 +21,13 @@ class _DeviceScanScreenState extends ConsumerState<DeviceScanScreen>
   late final AnimationController _pulseController;
 
   StreamSubscription<DiscoveredDevice>? _scanSubscription;
-  StreamSubscription<ConnectionStateUpdate>? _connectionSubscription;
   Timer? _scanTimer;
 
   final Map<String, DiscoveredDevice> _devices = {};
 
   bool _isScanning = false;
   bool _scanFinished = false;
-  bool _isConnecting = false;
-  bool _verificationInProgress = false;
 
-  String? _activeDeviceId;
-  String? _verifiedDeviceId;
   String? _message;
 
   @override
@@ -51,13 +46,12 @@ class _DeviceScanScreenState extends ConsumerState<DeviceScanScreen>
   void dispose() {
     _scanTimer?.cancel();
     unawaited(_scanSubscription?.cancel() ?? Future<void>.value());
-    unawaited(_connectionSubscription?.cancel() ?? Future<void>.value());
     _pulseController.dispose();
     super.dispose();
   }
 
   Future<void> _startScan() async {
-    if (_isScanning || _activeDeviceId != null) return;
+    if (_isScanning || ref.read(bleSessionProvider).deviceId != null) return;
 
     setState(() {
       _devices.clear();
@@ -130,139 +124,19 @@ class _DeviceScanScreenState extends ConsumerState<DeviceScanScreen>
   }
 
   Future<void> _connectToDevice(DiscoveredDevice device) async {
-    if (_activeDeviceId != null) return;
-
     await _stopScan();
 
     if (!mounted) return;
 
-    final manager = ref.read(bleManagerProvider);
-    final permission = await manager.requestConnectPermission();
-
-    if (!mounted) return;
-
-    if (!permission.isGranted) {
-      setState(() {
-        _message = permission.isPermanentlyDenied
-            ? 'Bluetooth connection permission is disabled. Allow Nearby devices in Android Settings.'
-            : 'Allow Nearby devices permission to connect.';
-      });
-
-      if (permission.isPermanentlyDenied) {
-        await openAppSettings();
-      }
-      return;
-    }
-
-    setState(() {
-      _activeDeviceId = device.id;
-      _verifiedDeviceId = null;
-      _isConnecting = true;
-      _message = 'Asking ${_displayName(device)} to accept the connection…';
-    });
-
-    _connectionSubscription = manager.connectToDevice(device.id).listen(
-          (update) {
-        if (!mounted || update.deviceId != device.id) return;
-
-        switch (update.connectionState) {
-          case DeviceConnectionState.connecting:
-            setState(() {
-              _isConnecting = true;
-              _message = 'Connecting to ${_displayName(device)}…';
-            });
-
-          case DeviceConnectionState.connected:
-            setState(() {
-              _isConnecting = false;
-              _message = 'Connected. Checking the device’s services…';
-            });
-            unawaited(_verifyDeviceProfile(manager, device));
-
-          case DeviceConnectionState.disconnecting:
-            setState(() {
-              _message = 'Disconnecting from ${_displayName(device)}…';
-            });
-
-          case DeviceConnectionState.disconnected:
-            setState(() {
-              _activeDeviceId = null;
-              _verifiedDeviceId = null;
-              _isConnecting = false;
-              _verificationInProgress = false;
-              _connectionSubscription = null;
-              _message ??= 'Device disconnected.';
-            });
-        }
-      },
-      onError: (Object error) {
-        if (!mounted) return;
-        setState(() {
-          _activeDeviceId = null;
-          _verifiedDeviceId = null;
-          _isConnecting = false;
-          _connectionSubscription = null;
-          _message = 'The device did not accept or complete the connection.';
-        });
-      },
+    final controller = ref.read(bleSessionProvider.notifier);
+    await controller.connect(
+      deviceId: device.id,
+      displayName: _displayName(device),
     );
   }
 
-  Future<void> _verifyDeviceProfile(
-      BleManager manager,
-      DiscoveredDevice device,
-      ) async {
-    if (_verificationInProgress) return;
-    _verificationInProgress = true;
-
-    try {
-      final services = await manager.discoverServices(device.id);
-      final isCompatible = manager.hasEnviroSenseProfile(services);
-
-      if (!mounted) return;
-
-      setState(() {
-        _isConnecting = false;
-        if (isCompatible) {
-          _verifiedDeviceId = device.id;
-          _message =
-          'EnviroSense service verified on ${_displayName(device)}. '
-              'Sensor data streaming is the next connection step.';
-        } else {
-          _verifiedDeviceId = null;
-          _message =
-          'The BLE connection succeeded, but this device does not expose '
-              'the complete EnviroSense service. It cannot provide readings to this app yet.';
-        }
-      });
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _isConnecting = false;
-        _verifiedDeviceId = null;
-        _message =
-        'Connected, but the device did not allow service discovery. '
-            'It may require pairing or use a different BLE profile.';
-      });
-    } finally {
-      _verificationInProgress = false;
-    }
-  }
-
   Future<void> _disconnect() async {
-    final subscription = _connectionSubscription;
-    _connectionSubscription = null;
-
-    await subscription?.cancel();
-
-    if (!mounted) return;
-
-    setState(() {
-      _activeDeviceId = null;
-      _verifiedDeviceId = null;
-      _isConnecting = false;
-      _message = 'Disconnected.';
-    });
+    await ref.read(bleSessionProvider.notifier).disconnect();
   }
 
   bool _advertisesEnviroSense(DiscoveredDevice device) {
@@ -285,6 +159,11 @@ class _DeviceScanScreenState extends ConsumerState<DeviceScanScreen>
   Widget build(BuildContext context) {
     final devices = _devices.values.toList()
       ..sort((a, b) => b.rssi.compareTo(a.rssi));
+
+    final session = ref.watch(bleSessionProvider);
+    final activeDeviceId = session.deviceId;
+    final isConnecting = session.status == BleSessionStatus.connecting;
+    final isVerified = session.profileVerified;
 
     return Scaffold(
       appBar: AppBar(
@@ -364,11 +243,11 @@ class _DeviceScanScreenState extends ConsumerState<DeviceScanScreen>
               style: TextStyle(color: AppTheme.textMuted, fontSize: 12),
             ),
           ],
-          if (_message != null) ...[
+          if ((session.statusMessage ?? _message) != null) ...[
             const SizedBox(height: 18),
-            _Notice(message: _message!),
+            _Notice(message: session.statusMessage ?? _message!),
           ],
-          if (_scanFinished && devices.isEmpty && _message == null) ...[
+          if (_scanFinished && devices.isEmpty && session.statusMessage == null && _message == null) ...[
             const SizedBox(height: 18),
             const _Notice(
               message:
@@ -393,19 +272,19 @@ class _DeviceScanScreenState extends ConsumerState<DeviceScanScreen>
                 displayName: _displayName(device),
                 shortId: _shortId(device.id),
                 advertisesEnviroSense: _advertisesEnviroSense(device),
-                isActive: _activeDeviceId == device.id,
-                isVerified: _verifiedDeviceId == device.id,
+                isActive: activeDeviceId == device.id,
+                isVerified: activeDeviceId == device.id && isVerified,
                 isConnecting:
-                _activeDeviceId == device.id && _isConnecting,
+                activeDeviceId == device.id && isConnecting,
                 anotherDeviceActive:
-                _activeDeviceId != null && _activeDeviceId != device.id,
+                activeDeviceId != null && activeDeviceId != device.id,
                 onConnect: () => _connectToDevice(device),
                 onDisconnect: _disconnect,
               ),
           ],
           const SizedBox(height: 22),
           FilledButton.icon(
-            onPressed: _activeDeviceId != null
+            onPressed: activeDeviceId != null
                 ? null
                 : _isScanning
                 ? _stopScan
