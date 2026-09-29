@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:device_info_plus/device_info_plus.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -87,7 +88,9 @@ class BleSessionController extends Notifier<BleSessionState> {
 
   @override
   BleSessionState build() {
+    debugPrint('[BLE] session controller created');
     ref.onDispose(() {
+      debugPrint('[BLE] session controller disposed');
       unawaited(_connectionSubscription?.cancel());
       unawaited(_telemetrySubscription?.cancel());
     });
@@ -99,6 +102,7 @@ class BleSessionController extends Notifier<BleSessionState> {
     required String deviceId,
     required String displayName,
   }) async {
+    debugPrint('[BLE] connect requested: $deviceId');
     if (state.isBusy) return;
 
     if (state.isConnected && state.deviceId == deviceId) return;
@@ -126,6 +130,7 @@ class BleSessionController extends Notifier<BleSessionState> {
 
     await _connectionSubscription?.cancel();
 
+    debugPrint('[BLE] subscribing to connection stream: $deviceId');
     _connectionSubscription = manager.connectToDevice(deviceId).listen(
           (update) {
         _handleConnectionUpdate(
@@ -135,6 +140,7 @@ class BleSessionController extends Notifier<BleSessionState> {
         );
       },
       onError: (Object error) {
+        debugPrint('[BLE] connection stream error: $error');
         unawaited(_telemetrySubscription?.cancel());
         _telemetrySubscription = null;
         state = BleSessionState(
@@ -152,6 +158,7 @@ class BleSessionController extends Notifier<BleSessionState> {
         required BleManager manager,
         required String displayName,
       }) {
+    debugPrint('[BLE] connection state: ${update.connectionState} for ${update.deviceId}');
     if (update.deviceId != state.deviceId) return;
 
     switch (update.connectionState) {
@@ -227,6 +234,13 @@ class BleSessionController extends Notifier<BleSessionState> {
         .subscribeToTelemetry(characteristic)
         .listen(
           (bytes) {
+        final rawPayload = utf8.decode(
+          bytes,
+          allowMalformed: true,
+        );
+        debugPrint('[BLE] telemetry bytes: $bytes');
+        debugPrint('[BLE] telemetry payload: $rawPayload');
+
         final reading = _parseTelemetry(bytes);
         if (reading == null || state.deviceId != deviceId) return;
 
@@ -253,8 +267,10 @@ class BleSessionController extends Notifier<BleSessionState> {
 
       if (decoded is! Map<String, dynamic>) return null;
 
-      final temperature = decoded['temperature'];
-      final humidity = decoded['humidity'];
+      // Accept the compact BLE packet from the ESP32 and the original
+      // long-key format for backward compatibility.
+      final temperature = decoded['t'] ?? decoded['temperature'];
+      final humidity = decoded['h'] ?? decoded['humidity'];
 
       if (temperature is! num || humidity is! num) return null;
 
@@ -269,6 +285,7 @@ class BleSessionController extends Notifier<BleSessionState> {
   }
 
   Future<void> disconnect() async {
+    debugPrint('[BLE] app requested disconnect');
     final connection = _connectionSubscription;
     final telemetry = _telemetrySubscription;
 

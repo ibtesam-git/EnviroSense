@@ -22,6 +22,7 @@ class _DeviceScanScreenState extends ConsumerState<DeviceScanScreen>
 
   StreamSubscription<DiscoveredDevice>? _scanSubscription;
   Timer? _scanTimer;
+  Timer? _deviceUiTimer;
 
   final Map<String, DiscoveredDevice> _devices = {};
 
@@ -45,6 +46,7 @@ class _DeviceScanScreenState extends ConsumerState<DeviceScanScreen>
   @override
   void dispose() {
     _scanTimer?.cancel();
+    _deviceUiTimer?.cancel();
     unawaited(_scanSubscription?.cancel() ?? Future<void>.value());
     _pulseController.dispose();
     super.dispose();
@@ -83,10 +85,17 @@ class _DeviceScanScreenState extends ConsumerState<DeviceScanScreen>
     _scanSubscription = manager.scanForNearbyBleDevices().listen(
           (device) {
         if (!mounted) return;
-        setState(() {
-          // Keep the newest signal/name data for each discovered device.
-          _devices[device.id] = device;
-        });
+        // BLE advertisements can arrive many times per second. Keep the
+        // newest device data, but redraw the scan list at most five times/sec.
+        _devices[device.id] = device;
+        if (_deviceUiTimer?.isActive ?? false) return;
+
+        _deviceUiTimer = Timer(
+          const Duration(milliseconds: 200),
+              () {
+            if (mounted) setState(() {});
+          },
+        );
       },
       onError: (Object error) {
         if (!mounted) return;
