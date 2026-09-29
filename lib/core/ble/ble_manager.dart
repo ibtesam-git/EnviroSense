@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:device_info_plus/device_info_plus.dart';
@@ -15,11 +16,6 @@ final bleManagerProvider = Provider<BleManager>((ref) {
   );
 });
 
-/// Persistent BLE session provider.
-///
-/// This provider is not auto-disposed. It stays alive for the lifetime of the
-/// app's ProviderScope, so navigating away from the scan page does not cancel
-/// the BLE connection.
 final bleSessionProvider =
 NotifierProvider<BleSessionController, BleSessionState>(
   BleSessionController.new,
@@ -33,18 +29,32 @@ enum BleSessionStatus {
   error,
 }
 
+class TelemetryReading {
+  const TelemetryReading({
+    required this.temperatureC,
+    required this.humidityPercent,
+    required this.receivedAt,
+  });
+
+  final double temperatureC;
+  final double humidityPercent;
+  final DateTime receivedAt;
+}
+
 class BleSessionState {
   const BleSessionState({
     this.status = BleSessionStatus.disconnected,
     this.deviceId,
     this.statusMessage,
     this.profileVerified = false,
+    this.telemetry,
   });
 
   final BleSessionStatus status;
   final String? deviceId;
   final String? statusMessage;
   final bool profileVerified;
+  final TelemetryReading? telemetry;
 
   bool get isConnected => status == BleSessionStatus.connected;
 
@@ -57,24 +67,29 @@ class BleSessionState {
     String? deviceId,
     String? statusMessage,
     bool? profileVerified,
+    TelemetryReading? telemetry,
     bool clearDeviceId = false,
+    bool clearTelemetry = false,
   }) {
     return BleSessionState(
       status: status ?? this.status,
       deviceId: clearDeviceId ? null : deviceId ?? this.deviceId,
       statusMessage: statusMessage ?? this.statusMessage,
       profileVerified: profileVerified ?? this.profileVerified,
+      telemetry: clearTelemetry ? null : telemetry ?? this.telemetry,
     );
   }
 }
 
 class BleSessionController extends Notifier<BleSessionState> {
   StreamSubscription<ConnectionStateUpdate>? _connectionSubscription;
+  StreamSubscription<List<int>>? _telemetrySubscription;
 
   @override
   BleSessionState build() {
     ref.onDispose(() {
       unawaited(_connectionSubscription?.cancel());
+      unawaited(_telemetrySubscription?.cancel());
     });
 
     return const BleSessionState();
@@ -84,27 +99,21 @@ class BleSessionController extends Notifier<BleSessionState> {
     required String deviceId,
     required String displayName,
   }) async {
-    if (state.isBusy) {
-      return;
-    }
+    if (state.isBusy) return;
 
-    if (state.isConnected && state.deviceId == deviceId) {
-      return;
-    }
+    if (state.isConnected && state.deviceId == deviceId) return;
 
     if (state.deviceId != null && state.deviceId != deviceId) {
       await disconnect();
     }
 
     final manager = ref.read(bleManagerProvider);
-
     final permission = await manager.requestConnectPermission();
 
     if (!permission.isGranted) {
-      state = BleSessionState(
+      state = const BleSessionState(
         status: BleSessionStatus.error,
-        statusMessage:
-        'Bluetooth connection permission was not granted.',
+        statusMessage: 'Bluetooth connection permission was not granted.',
       );
       return;
     }
@@ -117,9 +126,7 @@ class BleSessionController extends Notifier<BleSessionState> {
 
     await _connectionSubscription?.cancel();
 
-    _connectionSubscription = manager
-        .connectToDevice(deviceId)
-        .listen(
+    _connectionSubscription = manager.connectToDevice(deviceId).listen(
           (update) {
         _handleConnectionUpdate(
           update,
@@ -128,6 +135,8 @@ class BleSessionController extends Notifier<BleSessionState> {
         );
       },
       onError: (Object error) {
+        unawaited(_telemetrySubscription?.cancel());
+        _telemetrySubscription = null;
         state = BleSessionState(
           status: BleSessionStatus.error,
           deviceId: deviceId,
@@ -143,9 +152,7 @@ class BleSessionController extends Notifier<BleSessionState> {
         required BleManager manager,
         required String displayName,
       }) {
-    if (update.deviceId != state.deviceId) {
-      return;
-    }
+    if (update.deviceId != state.deviceId) return;
 
     switch (update.connectionState) {
       case DeviceConnectionState.connecting:
@@ -159,8 +166,8 @@ class BleSessionController extends Notifier<BleSessionState> {
           status: BleSessionStatus.connected,
           statusMessage: 'Connected to $displayName.',
         );
-
         unawaited(_verifyProfile(manager, update.deviceId));
+        unawaited(_startTelemetry(manager, update.deviceId));
 
       case DeviceConnectionState.disconnecting:
         state = state.copyWith(
@@ -169,7 +176,9 @@ class BleSessionController extends Notifier<BleSessionState> {
         );
 
       case DeviceConnectionState.disconnected:
-        state = BleSessionState(
+        unawaited(_telemetrySubscription?.cancel());
+        _telemetrySubscription = null;
+        state = const BleSessionState(
           status: BleSessionStatus.disconnected,
           statusMessage: 'Device disconnected.',
         );
@@ -184,9 +193,7 @@ class BleSessionController extends Notifier<BleSessionState> {
       final services = await manager.discoverServices(deviceId);
       final verified = manager.hasEnviroSenseProfile(services);
 
-      if (state.deviceId != deviceId) {
-        return;
-      }
+      if (state.deviceId != deviceId) return;
 
       state = state.copyWith(
         profileVerified: verified,
@@ -195,33 +202,86 @@ class BleSessionController extends Notifier<BleSessionState> {
             : 'Connected, but the EnviroSense BLE profile was not found.',
       );
     } catch (_) {
-      if (state.deviceId != deviceId) {
-        return;
-      }
+      if (state.deviceId != deviceId) return;
 
       state = state.copyWith(
         profileVerified: false,
-        statusMessage:
-        'Connected, but service discovery failed.',
+        statusMessage: 'Connected, but service discovery failed.',
       );
     }
   }
 
-  Future<void> disconnect() async {
-    final subscription = _connectionSubscription;
+  Future<void> _startTelemetry(
+      BleManager manager,
+      String deviceId,
+      ) async {
+    await _telemetrySubscription?.cancel();
 
-    if (subscription == null) {
-      state = const BleSessionState();
-      return;
+    final characteristic = QualifiedCharacteristic(
+      serviceId: Uuid.parse(EnviroSenseGattProfile.service),
+      characteristicId: Uuid.parse(EnviroSenseGattProfile.telemetry),
+      deviceId: deviceId,
+    );
+
+    _telemetrySubscription = manager
+        .subscribeToTelemetry(characteristic)
+        .listen(
+          (bytes) {
+        final reading = _parseTelemetry(bytes);
+        if (reading == null || state.deviceId != deviceId) return;
+
+        state = state.copyWith(
+          telemetry: reading,
+          statusMessage: 'Receiving live DHT22 readings.',
+        );
+      },
+      onError: (Object error) {
+        if (state.deviceId != deviceId) return;
+
+        state = state.copyWith(
+          statusMessage: 'Connected, but telemetry notifications failed.',
+        );
+      },
+    );
+  }
+
+  TelemetryReading? _parseTelemetry(List<int> bytes) {
+    try {
+      final decoded = jsonDecode(
+        utf8.decode(bytes, allowMalformed: true),
+      );
+
+      if (decoded is! Map<String, dynamic>) return null;
+
+      final temperature = decoded['temperature'];
+      final humidity = decoded['humidity'];
+
+      if (temperature is! num || humidity is! num) return null;
+
+      return TelemetryReading(
+        temperatureC: temperature.toDouble(),
+        humidityPercent: humidity.toDouble(),
+        receivedAt: DateTime.now(),
+      );
+    } catch (_) {
+      return null;
     }
+  }
+
+  Future<void> disconnect() async {
+    final connection = _connectionSubscription;
+    final telemetry = _telemetrySubscription;
+
+    _connectionSubscription = null;
+    _telemetrySubscription = null;
 
     state = state.copyWith(
       status: BleSessionStatus.disconnecting,
       statusMessage: 'Disconnecting…',
     );
 
-    _connectionSubscription = null;
-    await subscription.cancel();
+    await telemetry?.cancel();
+    await connection?.cancel();
 
     state = const BleSessionState(
       status: BleSessionStatus.disconnected,
@@ -237,9 +297,7 @@ class BleManager {
   final DeviceInfoPlugin _deviceInfo;
 
   Future<PermissionStatus> requestScanPermission() async {
-    if (!Platform.isAndroid) {
-      return PermissionStatus.granted;
-    }
+    if (!Platform.isAndroid) return PermissionStatus.granted;
 
     final androidInfo = await _deviceInfo.androidInfo;
 
@@ -251,9 +309,7 @@ class BleManager {
   }
 
   Future<PermissionStatus> requestConnectPermission() async {
-    if (!Platform.isAndroid) {
-      return PermissionStatus.granted;
-    }
+    if (!Platform.isAndroid) return PermissionStatus.granted;
 
     final androidInfo = await _deviceInfo.androidInfo;
 
@@ -271,25 +327,25 @@ class BleManager {
     );
   }
 
-  Stream<ConnectionStateUpdate> connectToDevice(
-      String deviceId,
-      ) {
+  Stream<ConnectionStateUpdate> connectToDevice(String deviceId) {
     return _ble.connectToDevice(
       id: deviceId,
       connectionTimeout: const Duration(seconds: 10),
     );
   }
 
-  Future<List<Service>> discoverServices(
-      String deviceId,
-      ) async {
+  Stream<List<int>> subscribeToTelemetry(
+      QualifiedCharacteristic characteristic,
+      ) {
+    return _ble.subscribeToCharacteristic(characteristic);
+  }
+
+  Future<List<Service>> discoverServices(String deviceId) async {
     await _ble.discoverAllServices(deviceId);
     return _ble.getDiscoveredServices(deviceId);
   }
 
-  bool hasEnviroSenseProfile(
-      List<Service> services,
-      ) {
+  bool hasEnviroSenseProfile(List<Service> services) {
     final expectedService = Uuid.parse(
       EnviroSenseGattProfile.service,
     );
@@ -302,9 +358,7 @@ class BleManager {
     ];
 
     for (final service in services) {
-      if (service.id != expectedService) {
-        continue;
-      }
+      if (service.id != expectedService) continue;
 
       final characteristicIds = service.characteristics
           .map((characteristic) => characteristic.id);
